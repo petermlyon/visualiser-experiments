@@ -1,0 +1,538 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1.0">
+    <title>Webcam Stream WebGL Fullscreen (Fisheye)</title>
+    <style>
+        html, body {
+            height: 100%;
+            margin: 0;
+            padding: 0;
+            background: #111;
+        }
+        body {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: flex-start;
+            min-height: 100vh;
+        }
+        #webgl-canvas {
+            display: block;
+            background: #222;
+            width: 100vw;
+            height: 100vh;
+            max-width: 100vw;
+            max-height: 100vh;
+        }
+        .controls {
+            position: absolute;
+            top: 16px;
+            left: 0;
+            width: 100vw;
+            display: flex;
+            justify-content: center;
+            z-index: 10;
+        }
+        .controls > * { margin: 0 8px; }
+        #fullscreen-btn {
+            font-size: 1rem;
+            padding: 0.3em 1em;
+        }
+    </style>
+</head>
+<body>
+    <div class="controls">
+        <label for="speed-slider">Rotation speed: </label>
+        <input type="range" min="0" max="30" value="10" step="1" id="speed-slider">
+        <span id="speed-value">10</span> RPM
+        <label for="threshold-slider">Threshold: </label>
+        <input type="range" min="0" max="1" value="0.3" step="0.01" id="threshold-slider">
+        <span id="threshold-value">0.30</span>
+        <label for="sensitivity-slider">Sensitivity</label>
+        <input type="range" min="0.5" max="150.0" value="70" step="0.01" id="sensitivity-slider">
+        <button id="fullscreen-btn">Fullscreen</button>
+        <button id="next-image-btn">Next Image</button>
+    </div>
+    <canvas id="webgl-canvas"></canvas>
+    <video id="webcam" autoplay playsinline muted style="display: none;"></video>
+    <script id="vertex-shader" type="x-shader/x-vertex">
+        attribute vec2 a_position;
+        attribute vec2 a_texCoord;
+        varying vec2 v_texCoord;
+        void main() {
+            gl_Position = vec4(a_position, 0, 1);
+            v_texCoord = a_texCoord;
+        }
+    </script>
+    <script id="fragment-shader" type="x-shader/x-fragment">
+        precision mediump float;
+        varying vec2 v_texCoord;
+        uniform sampler2D u_video;
+        uniform sampler2D u_image;
+        uniform sampler2D u_nextImage;
+        uniform float u_fadeFactor;
+        uniform float u_angle;
+        uniform float u_hueShift;
+        uniform float u_aspect;
+        uniform float u_threshold;
+uniform float u_brightness;
+        
+        // Hue shift utility
+        vec3 rgb2hsv(vec3 c) {
+            vec4 K = vec4(0.0, -1.0/3.0, 2.0/3.0, -1.0);
+            vec4 p = mix(vec4(c.bg, K.wz), vec4(c.gb, K.xy), step(c.b, c.g));
+            vec4 q = mix(vec4(p.xyw, c.r), vec4(c.r, p.yzx), step(p.x, c.r));
+            float d = q.x - min(q.w, q.y);
+            float e = 1.0e-10;
+            return vec3(abs(q.z + (q.w - q.y) / (6.0 * d + e)), d / (q.x + e), q.x);
+        }
+        vec3 hsv2rgb(vec3 c) {
+            vec4 K = vec4(1.0, 2.0/3.0, 1.0/3.0, 3.0);
+            vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
+            return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
+        }
+        
+        void main() {
+    // --- 1. Geometric transforms: map output fragment to v_texCoord ---
+    float aspect = u_aspect;
+    float squareX, squareY;
+    if (aspect > 1.0) {
+        squareX = (v_texCoord.x - 0.5) * aspect + 0.5;
+        squareY = v_texCoord.y;
+    } else {
+        squareX = v_texCoord.x;
+        squareY = (v_texCoord.y - 0.5) / aspect + 0.5;
+    }
+    float nx = (squareX - 0.5) * 2.0;
+    float ny = (squareY - 0.5) * 2.0;
+    nx = abs(nx);
+    ny = abs(ny);
+    float cosA = cos(u_angle);
+    float sinA = sin(u_angle);
+    float rx = nx * cosA - ny * sinA;
+    float ry = nx * sinA + ny * cosA;
+    float r_out = sqrt(rx * rx + ry * ry);
+    float r_in = sin(r_out * 1.57079632679);
+    float scale = r_in / (r_out > 0.0 ? r_out : 1.0);
+    float tx = rx * scale * 0.5 + 0.5;
+    float ty = ry * scale * 0.5 + 0.5;
+    vec2 srcCoord = vec2(tx, ty);
+
+    // --- 2. Compute mask and crossfade in srcCoord (original image space) ---
+    vec4 webcam = texture2D(u_video, srcCoord);
+    float grey = dot(webcam.rgb, vec3(0.2989, 0.5870, 0.1140));
+    float mask = step(u_threshold, grey);
+    vec4 imgA = texture2D(u_image, srcCoord);
+    vec4 imgB = texture2D(u_nextImage, srcCoord);
+    vec4 img = mix(imgA, imgB, u_fadeFactor);
+    vec4 masked = img * mask;
+
+    // --- 3. Output ---
+    gl_FragColor = vec4(masked.rgb * u_brightness, 1.0);
+}
+
+    </script>
+    <script>
+    // --- WebGL utility functions ---
+    function createShader(gl, type, source) {
+        const shader = gl.createShader(type);
+        gl.shaderSource(shader, source);
+        gl.compileShader(shader);
+        if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+            throw new Error(gl.getShaderInfoLog(shader));
+        }
+        return shader;
+    }
+    function createProgram(gl, vertexShader, fragmentShader) {
+        const program = gl.createProgram();
+        gl.attachShader(program, vertexShader);
+        gl.attachShader(program, fragmentShader);
+        gl.linkProgram(program);
+        if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+            throw new Error(gl.getProgramInfoLog(program));
+        }
+        return program;
+    }
+    // --- Main ---
+    const video = document.getElementById('webcam');
+    const canvas = document.getElementById('webgl-canvas');
+    const speedSlider = document.getElementById('speed-slider');
+    const speedValue = document.getElementById('speed-value');
+    const fullscreenBtn = document.getElementById('fullscreen-btn');
+    const nextImageBtn = document.getElementById('next-image-btn');
+    const sensitivitySlider = document.getElementById('sensitivity-slider');
+    const sensitivityValue = document.getElementById('sensitivity-value');
+    let audioSensitivity = 70;
+    sensitivitySlider.addEventListener('input', () => {
+    audioSensitivity = parseFloat(sensitivitySlider.value);
+    sensitivityValue.textContent = audioSensitivity.toFixed(2);
+});
+
+    nextImageBtn.addEventListener('click', () => {
+        startImageFade();
+        // Reset the timer so it doesn't auto-switch right after manual
+        lastImageSwitchTime = performance.now() / 1000;
+        imageSwitchInterval = 20 + Math.random() * 20;
+    });
+    let sliderThreshold = 0.3;
+    let threshold = sliderThreshold;
+    let audioVolume = 0;
+    let audioEnabled = false;
+    // --- Audio normalization buffer ---
+    const AUDIO_HISTORY_SECONDS = 5;
+    let audioHistory = []; // Array of {time, volume}
+    function pruneAudioHistory(now) {
+        // Remove samples older than AUDIO_HISTORY_SECONDS
+        while (audioHistory.length && (now - audioHistory[0].time) > AUDIO_HISTORY_SECONDS) {
+            audioHistory.shift();
+        }
+    }
+    function getAudioStats(now) {
+        pruneAudioHistory(now);
+        if (!audioHistory.length) return {avg: 0, min: 0, max: 0};
+        let sum = 0, min = Infinity, max = -Infinity;
+        for (const s of audioHistory) {
+            sum += s.volume;
+            if (s.volume < min) min = s.volume;
+            if (s.volume > max) max = s.volume;
+        }
+        return {avg: sum / audioHistory.length, min, max};
+    }
+
+    let INTERNAL_WIDTH = window.innerWidth;
+    let INTERNAL_HEIGHT = window.innerHeight;
+
+    function setCanvasSize() {
+        const w = window.innerWidth;
+        const h = window.innerHeight;
+        canvas.width = w;
+        canvas.height = h;
+        INTERNAL_WIDTH = w;
+        INTERNAL_HEIGHT = h;
+    }
+    setCanvasSize();
+    window.addEventListener('resize', setCanvasSize);
+
+    fullscreenBtn.addEventListener('click', () => {
+        if (canvas.requestFullscreen) canvas.requestFullscreen();
+        else if (canvas.webkitRequestFullscreen) canvas.webkitRequestFullscreen();
+        else if (canvas.mozRequestFullScreen) canvas.mozRequestFullScreen();
+        else if (canvas.msRequestFullscreen) canvas.msRequestFullscreen();
+    });
+    document.addEventListener('fullscreenchange', setCanvasSize);
+    document.addEventListener('webkitfullscreenchange', setCanvasSize);
+    document.addEventListener('mozfullscreenchange', setCanvasSize);
+    document.addEventListener('MSFullscreenChange', setCanvasSize);
+
+    let gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+    let vertexShader = createShader(gl, gl.VERTEX_SHADER, document.getElementById('vertex-shader').textContent);
+    let fragmentShader = createShader(gl, gl.FRAGMENT_SHADER, document.getElementById('fragment-shader').textContent);
+    let program = createProgram(gl, vertexShader, fragmentShader);
+    gl.useProgram(program);
+
+    // Attribute and uniform locations
+    let a_position = gl.getAttribLocation(program, 'a_position');
+    let a_texCoord = gl.getAttribLocation(program, 'a_texCoord');
+    let u_video = gl.getUniformLocation(program, 'u_video');
+    let u_angle = gl.getUniformLocation(program, 'u_angle');
+    let u_hueShiftLoc = gl.getUniformLocation(program, 'u_hueShift');
+    let u_aspect = gl.getUniformLocation(program, 'u_aspect');
+    let u_image = gl.getUniformLocation(program, 'u_image');
+    let u_nextImage = gl.getUniformLocation(program, 'u_nextImage');
+    let u_fadeFactor = gl.getUniformLocation(program, 'u_fadeFactor');
+    let u_threshold = gl.getUniformLocation(program, 'u_threshold');
+    let u_brightness = gl.getUniformLocation(program, 'u_brightness');
+
+    // Set up geometry (two triangles covering the canvas)
+    let positionBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+        -1, -1,
+         1, -1,
+        -1,  1,
+        -1,  1,
+         1, -1,
+         1,  1
+    ]), gl.STATIC_DRAW);
+    let texCoordBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, texCoordBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+        0, 0,
+        1, 0,
+        0, 1,
+        0, 1,
+        1, 0,
+        1, 1
+    ]), gl.STATIC_DRAW);
+
+    // --- Webcam setup ---
+    navigator.mediaDevices.getUserMedia({
+        video: {
+            facingMode: 'user',
+            width: { ideal: 1920 },
+            height: { ideal: 1080 }
+        },
+        audio: true
+    }).then(stream => {
+        video.setAttribute('autoplay', '');
+        video.setAttribute('playsinline', '');
+        video.setAttribute('muted', '');
+        video.srcObject = stream;
+        video.play();
+
+        // --- Audio setup ---
+        if (stream.getAudioTracks().length > 0) {
+            try {
+                const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                const analyser = audioCtx.createAnalyser();
+                analyser.fftSize = 1024;
+                const source = audioCtx.createMediaStreamSource(stream);
+                // Add a low-pass filter at 250 Hz
+                const lowpass = audioCtx.createBiquadFilter();
+                lowpass.type = 'lowpass';
+                lowpass.frequency.value = 250;
+                source.connect(lowpass);
+                lowpass.connect(analyser);
+                const dataArray = new Uint8Array(analyser.fftSize);
+                audioEnabled = true;
+
+                function updateAudioVolume() {
+                    analyser.getByteTimeDomainData(dataArray);
+                    // Compute RMS volume (normalized 0-1)
+                    let sum = 0;
+                    for (let i = 0; i < dataArray.length; i++) {
+                        let v = (dataArray[i] - 128) / 128;
+                        sum += v * v;
+                    }
+                    audioVolume = Math.sqrt(sum / dataArray.length);
+                    // Add to history with timestamp (seconds)
+                    audioHistory.push({time: performance.now() / 1000, volume: audioVolume});
+                    requestAnimationFrame(updateAudioVolume);
+                }
+                updateAudioVolume();
+            } catch (e) {
+                audioEnabled = false;
+            }
+        }
+        // Only start animation once video is playing
+        video.onplaying = () => {
+            if ('requestVideoFrameCallback' in video) {
+                function rafc() {
+                    drawFrame(performance.now());
+                    video.requestVideoFrameCallback(rafc);
+                }
+                video.requestVideoFrameCallback(rafc);
+            } else {
+                requestAnimationFrame(drawFrame);
+            }
+        };
+    });
+
+    // --- Texture setup ---
+    let videoTexture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, videoTexture);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+    // --- Second image texture ---
+    let imageFilenames = [
+        'images/2853.png',
+        'images/2904.png',
+        'images/2939.png',
+        'images/2942.png',
+        'images/2997.png'
+    ];
+    let imageTexture = gl.createTexture();
+    let nextImageTexture = gl.createTexture();
+    let imageLoaded = false;
+    let nextImageLoaded = false;
+    let currentImageIdx = 0;
+    let nextImageIdx = 1;
+    let fadeStartTime = null;
+    let fading = false;
+    let fadeDuration = 2.5; // seconds for fade
+    let imageSwitchInterval = 20 + Math.random() * 20; // random 20-40s
+    let lastImageSwitchTime = performance.now() / 1000;
+    let fadeFactor = 0; // 0 = current, 1 = next
+
+    function loadImageToTexture(idx, texture, cb) {
+        let img = new window.Image();
+        img.onload = function() {
+            gl.bindTexture(gl.TEXTURE_2D, texture);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+            if (cb) cb();
+        };
+        img.src = imageFilenames[idx];
+    }
+    // Initial load
+    loadImageToTexture(currentImageIdx, imageTexture, () => { imageLoaded = true; });
+
+    function startImageFade() {
+        fading = true;
+        fadeStartTime = performance.now() / 1000;
+        fadeFactor = 0;
+        // Pick a new random image that's not the current
+        let available = imageFilenames.filter((_, i) => i !== currentImageIdx);
+        let pick = available[Math.floor(Math.random() * available.length)];
+        nextImageIdx = imageFilenames.indexOf(pick);
+        loadImageToTexture(nextImageIdx, nextImageTexture, () => { nextImageLoaded = true; });
+        nextImageLoaded = false;
+    }
+
+    function updateTexture() {
+        gl.bindTexture(gl.TEXTURE_2D, videoTexture);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
+    }
+
+    // --- For threshold auto-adjust ---
+    const offscreen = document.createElement('canvas');
+    const offctx = offscreen.getContext('2d');
+    function computeMedianGreyscale(video) {
+        // Use a small sample size for speed
+        const SAMPLE_W = 64, SAMPLE_H = 48;
+        offscreen.width = SAMPLE_W;
+        offscreen.height = SAMPLE_H;
+        offctx.drawImage(video, 0, 0, SAMPLE_W, SAMPLE_H);
+        const frame = offctx.getImageData(0, 0, SAMPLE_W, SAMPLE_H).data;
+        const greys = [];
+        for (let i = 0; i < frame.length; i += 4) {
+            const r = frame[i], g = frame[i+1], b = frame[i+2];
+            // Same weights as shader
+            const grey = 0.2989 * r + 0.5870 * g + 0.1140 * b;
+            greys.push(grey/255);
+        }
+        greys.sort((a, b) => a - b);
+        return greys[Math.floor(greys.length/2)] || 0.5;
+    }
+
+    let currentEighth = 0;
+    let prevHueShift = Math.random();
+    let nextHueShift = Math.random();
+    let rotationRPM = 1;
+    let phaseIncrement = (rotationRPM * 2 * Math.PI) / 60;
+    let currentAngle = 0;
+    let lastTimestamp = null;
+
+    function drawFrame(ts) {
+        if (!video.videoWidth) {
+            if ('requestVideoFrameCallback' in video) return;
+            requestAnimationFrame(drawFrame);
+            return;
+        }
+        if (lastTimestamp === null) lastTimestamp = ts;
+        // --- Binary RPM based on top 20% volume ---
+        const nowSec = ts / 1000;
+        pruneAudioHistory(nowSec);
+        const sorted = audioHistory.map(s => s.volume).sort((a, b) => a - b);
+        let thresholdIdx = Math.floor(sorted.length * 0.8);
+        let thresholdVol = sorted.length ? sorted[thresholdIdx] : 1;
+        // Map audio volume to rotation speed (RPM)
+        let minRPM = 5, maxRPM = 20;
+        // Smoothing for rotation speed: fade to new value over 20ms
+        if (typeof smoothedRPM === 'undefined') smoothedRPM = minRPM;
+        let targetRPM = (audioVolume >= thresholdVol) ? maxRPM : minRPM;
+        let nowTimeRPM = performance.now();
+        if (typeof lastRPMUpdate === 'undefined') lastRPMUpdate = nowTimeRPM;
+        let dtRPM = Math.max(0.001, (nowTimeRPM - lastRPMUpdate) / 1000);
+        lastRPMUpdate = nowTimeRPM;
+        let rpmDecayTime = 0.020; // 20ms
+        let rpmDecay = Math.exp(-dtRPM / rpmDecayTime);
+        smoothedRPM = smoothedRPM * rpmDecay + targetRPM * (1 - rpmDecay);
+        rotationRPM = smoothedRPM;
+        speedValue.textContent = rotationRPM.toFixed(1);
+        phaseIncrement = (rotationRPM * 2 * Math.PI) / 60;
+        let delta = (ts - lastTimestamp) / 1000.0;
+        currentAngle += phaseIncrement * delta;
+        lastTimestamp = ts;
+
+        // Update hue shift every 1/8 rotation
+        const eighth = Math.floor((currentAngle / (Math.PI / 4)) % 8);
+        if (eighth !== currentEighth) {
+            currentEighth = eighth;
+            prevHueShift = nextHueShift;
+            nextHueShift = Math.random();
+        }
+        // Fade between prev and next hue shift
+        const segmentProgress = ((currentAngle / (Math.PI / 4)) % 1);
+        let hueShift = prevHueShift + (nextHueShift - prevHueShift) * segmentProgress;
+
+        updateTexture();
+        gl.viewport(0, 0, canvas.width, canvas.height);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        gl.useProgram(program);
+        gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+        gl.enableVertexAttribArray(a_position);
+        gl.vertexAttribPointer(a_position, 2, gl.FLOAT, false, 0, 0);
+        gl.bindBuffer(gl.ARRAY_BUFFER, texCoordBuffer);
+        gl.enableVertexAttribArray(a_texCoord);
+        gl.vertexAttribPointer(a_texCoord, 2, gl.FLOAT, false, 0, 0);
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, videoTexture);
+        gl.uniform1i(u_video, 0);
+        gl.activeTexture(gl.TEXTURE1);
+        gl.bindTexture(gl.TEXTURE_2D, imageTexture);
+        gl.uniform1i(u_image, 1);
+        gl.activeTexture(gl.TEXTURE2);
+        gl.bindTexture(gl.TEXTURE_2D, nextImageTexture);
+        gl.uniform1i(u_nextImage, 2);
+        gl.uniform1f(u_fadeFactor, fadeFactor);
+        gl.uniform1f(u_angle, currentAngle);
+        gl.uniform1f(u_hueShiftLoc, hueShift);
+        gl.uniform1f(u_aspect, canvas.width / canvas.height);
+        // --- Automatically adjust threshold to maximize variation (median split) ---
+        threshold = computeMedianGreyscale(video);
+        if (typeof thresholdValue !== 'undefined' && thresholdValue) thresholdValue.textContent = threshold.toFixed(2);
+        gl.uniform1f(u_threshold, threshold);
+// Smoothing for brightness: rise instantly, decay over 150ms
+typeof smoothedBrightness === 'undefined' ? smoothedBrightness = 0 : null;
+const targetBrightness = Math.max(0, Math.min(1, audioVolume * audioSensitivity));
+const nowTime = performance.now();
+if (typeof lastBrightnessUpdate === 'undefined') lastBrightnessUpdate = nowTime;
+const dt = Math.max(0.001, (nowTime - lastBrightnessUpdate) / 1000);
+lastBrightnessUpdate = nowTime;
+const decayTime = 1.0; // 1 second for both up and down
+const decay = Math.exp(-dt / decayTime);
+smoothedBrightness = smoothedBrightness * decay + targetBrightness * (1 - decay);
+gl.uniform1f(u_brightness, smoothedBrightness);
+
+        if (imageLoaded) {
+            gl.drawArrays(gl.TRIANGLES, 0, 6);
+        }
+        // --- Handle image switching and fade ---
+        let now = performance.now() / 1000;
+        if (!fading && now - lastImageSwitchTime > imageSwitchInterval) {
+            startImageFade();
+            lastImageSwitchTime = now;
+            imageSwitchInterval = 20 + Math.random() * 20;
+        }
+        if (fading) {
+            if (nextImageLoaded) {
+                fadeFactor = Math.min(1, (now - fadeStartTime) / fadeDuration);
+                if (fadeFactor >= 1) {
+                    // Swap textures
+                    let tmp = imageTexture;
+                    imageTexture = nextImageTexture;
+                    nextImageTexture = tmp;
+                    currentImageIdx = nextImageIdx;
+                    imageLoaded = true;
+                    nextImageLoaded = false;
+                    fading = false;
+                    fadeFactor = 0;
+                }
+            }
+        }
+        if (!('requestVideoFrameCallback' in video)) {
+            requestAnimationFrame(drawFrame);
+        }
+    }
+    </script>
+</body>
+</html>
